@@ -278,7 +278,7 @@ const App = () => {
         .shelf-sim .btn:hover { background:#232b40; }
         .shelf-sim .btn.good { border-color:#1a6146; background:#103226; }
         .shelf-sim .btn.bad { border-color:#5a2730; background:#2b1418; }
-        .shelf-sim .app { display:grid; height: calc(100vh - 54px); transition: grid-template-columns .25s ease; }
+        .shelf-sim .app { display:grid; flex:1; min-height:0; transition: grid-template-columns .25s ease; grid-template-rows: 1fr; overflow:hidden; }
         .shelf-sim aside { background: linear-gradient(180deg, #121622, #0f121b); border-right:1px solid #1d2333; overflow:auto; }
         .shelf-sim aside.right { border-left:1px solid #1d2333; border-right:none; }
         .shelf-sim aside.collapsed { overflow:hidden; }
@@ -297,7 +297,7 @@ const App = () => {
         .shelf-sim .swatch { width:46px; height:46px; border-radius:8px; border:1px solid #2a3a57; background:#333; background-size:cover; background-position:center; }
         .shelf-sim .type-title { font-size:13px; font-weight:600; }
         .shelf-sim .type-meta { font-size:11px; color:#9aacbf; }
-        .shelf-sim main { position:relative; overflow:auto; }
+        .shelf-sim main { position:relative; overflow:auto; min-width:0; }
         .shelf-sim #stage { position:relative; min-height:100%; padding:20px; }
         .shelf-sim .shelf-wrap { position:relative; margin:0 auto; display:inline-block; padding:18px 18px 26px; border-radius:18px; background: linear-gradient(180deg,#1c2436,#0d1017); box-shadow: 0 10px 40px rgba(0,0,0,.35), inset 0 0 0 1px #2a344a; }
         .shelf-sim .shelf { position:relative; background:#bbc6d9; border-radius:12px; overflow:visible; box-shadow: inset 0 -60px 120px rgba(0,0,0,.25), inset 0 30px 60px rgba(0,0,0,.18); background-image: linear-gradient(to bottom, rgba(255,255,255,.06), rgba(255,255,255,0)), radial-gradient(600px 70px at 50% 0%, rgba(0,0,0,.45), rgba(0,0,0,0) 70%), linear-gradient(to top, rgba(0,0,0,.35), rgba(0,0,0,.0) 70%); background-blend-mode: overlay, normal, normal; }
@@ -307,7 +307,7 @@ const App = () => {
         .shelf-sim .row .plane { position:absolute; left:0; right:0; bottom:0; height:28px; pointer-events:none; background:linear-gradient(to top, rgba(0,0,0,.42), rgba(0,0,0,.08)); border-bottom-left-radius:12px; border-bottom-right-radius:12px; }
         .shelf-sim .row .backshade { position:absolute; left:0; right:0; top:0; height:70%; pointer-events:none; background:linear-gradient(to bottom, rgba(0,0,0,.55), rgba(0,0,0,0)); border-top-left-radius:12px; border-top-right-radius:12px; }
         .shelf-sim .row .lip { position:absolute; left:0; right:0; bottom:0; height:10px; background: linear-gradient(to bottom, #9aa5b6, #7b8594); box-shadow: 0 6px 8px rgba(0,0,0,.35); border-bottom-left-radius:12px; border-bottom-right-radius:12px; }
-        .shelf-sim .measure { position:absolute; right:-64px; top:50%; transform:translateY(-50%); font-size:11px; color:#9aacbf; background:#0b0f17; border:1px solid #21304a; padding:4px 6px; border-radius:8px; }
+        .shelf-sim .measure { position:absolute; right:8px; top:50%; transform:translateY(-50%); font-size:11px; color:#9aacbf; background:#0b0f17; border:1px solid #21304a; padding:4px 6px; border-radius:8px; }
         .shelf-sim .item { position:absolute; user-select:none; touch-action:none; cursor:grab; border-radius:6px; border:1px solid rgba(0,0,0,.35); background: linear-gradient(180deg, rgba(255,255,255,.18), rgba(255,255,255,0)), #6aa8ff; box-shadow: 0 10px 20px rgba(0,0,0,.35), 0 1px 0 rgba(255,255,255,.1) inset; overflow:hidden; }
         .shelf-sim .item.dragging { cursor:grabbing; box-shadow: 0 20px 40px rgba(0,0,0,.55), 0 0 0 2px rgba(255,255,255,.08) inset; }
         .shelf-sim .item .img { position:absolute; inset:0; background-size:cover; background-position:center; opacity:.95; mix-blend-mode:normal; }
@@ -338,7 +338,7 @@ const App = () => {
 
       <div
         className="app"
-        style={{ gridTemplateColumns: `${leftCollapsed ? 28 : 320}px 1fr ${rightCollapsed ? 28 : 300}px` }}
+        style={{ gridTemplateColumns: `${leftCollapsed ? 28 : 320}px minmax(0,1fr) ${rightCollapsed ? 28 : 300}px` }}
       >
         <aside className={leftCollapsed ? 'collapsed' : ''}>
           {leftCollapsed && (
