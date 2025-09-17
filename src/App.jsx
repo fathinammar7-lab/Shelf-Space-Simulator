@@ -1,4 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { DndContext, useDraggable, useDroppable } from '@dnd-kit/core';
+import RowConfigPanel from './planogram/RowConfigPanel.jsx';
 
 const LS_KEYS = {
   CONFIG: 'shelfSim.config.v1',
@@ -41,9 +43,26 @@ const App = () => {
   const rowsRef = useRef(new Map()); // index -> HTMLElement
   const itemNodesRef = useRef(new Map()); // id -> HTMLElement
   const dragRef = useRef(null); // { id, startX, startY, dx, dy }
+  // dnd-kit state
+  const [activeId, setActiveId] = useState(null);
+  const [clientPos, setClientPos] = useState({ x: 0, y: 0 });
+  const [selectedId, setSelectedId] = useState(null);
+  const [panelOpen, setPanelOpen] = useState(false);
+  const [selectedRow, setSelectedRow] = useState(null);
+
+  // Keep side panels exclusive
+  useEffect(() => { if (panelOpen) setRightCollapsed(true); }, [panelOpen]);
+  useEffect(() => { if (!rightCollapsed && panelOpen) setPanelOpen(false); }, [rightCollapsed, panelOpen]);
 
   const cm2px = useCallback((cm) => cm * scale, [scale]);
   const px2cm = useCallback((px) => px / scale, [scale]);
+
+  // Effective dimensions of an item considering rotation
+  const getDims = useCallback((item) => {
+    const t = types.find(tt => tt.id === item.typeId);
+    if (!t) return { w: 0, h: 0, d: 0 };
+    return item?.rot ? { w: t.h, h: t.w, d: t.d } : { w: t.w, h: t.h, d: t.d };
+  }, [types]);
 
   // Load state from localStorage
   useEffect(() => {
@@ -106,21 +125,46 @@ const App = () => {
   const fitsInRow = useCallback((item, rowIndex, x, z) => {
     const t = types.find(tt => tt.id === item.typeId); if (!t) return false;
     const row = shelf.rows[rowIndex]; if (!row) return false;
-    if (t.h > row.height) return false;
-    if (t.w > shelf.width) return false;
-    if (t.d > row.depth) return false;
+    const dms = getDims(item);
+    if (dms.h > row.height) return false;
+    if (dms.w > shelf.width) return false;
+    if (dms.d > row.depth) return false;
     if (x < 0 || z < 0) return false;
-    if (x + t.w > shelf.width) return false;
-    if (z + t.d > row.depth) return false;
-    const target = { x1: x, x2: x + t.w, z1: z, z2: z + t.d };
+    if (x + dms.w > shelf.width) return false;
+    if (z + dms.d > row.depth) return false;
+    const target = { x1: x, x2: x + dms.w, z1: z, z2: z + dms.d };
+    const groupId = item.group || null;
     for (const other of items) {
       if (other.id === item.id) continue; if (other.row !== rowIndex) continue;
-      const to = types.find(tt => tt.id === other.typeId); if (!to) continue;
-      const r = { x1: other.x, x2: other.x + to.w, z1: other.z, z2: other.z + to.d };
-      if (rectOverlap(target, r)) return false;
+      const od = getDims(other);
+      const r = { x1: other.x, x2: other.x + od.w, z1: other.z, z2: other.z + od.d };
+      if (rectOverlap(target, r)) {
+        // Allow vertical stacking if same group and exact same cell (x,z),
+        // as long as total stacked height fits within the row height.
+        if (groupId && other.group === groupId) {
+          const eps = 1e-6;
+          const sameCell = Math.abs(other.x - x) < eps && Math.abs(other.z - z) < eps && Math.abs(od.w - dms.w) < eps && Math.abs(od.d - dms.d) < eps;
+          if (sameCell) {
+            const maxLayers = Math.floor((row.height + 1e-6) / dms.h);
+            // count existing layers at this cell (exclude the candidate item itself)
+            let layers = 0;
+            for (const it of items) {
+              if (it.id === item.id) continue;
+              if (it.row !== rowIndex) continue;
+              if (it.group !== groupId) continue;
+              const dt = getDims(it);
+              if (Math.abs(it.x - x) < eps && Math.abs(it.z - z) < eps && Math.abs(dt.w - dms.w) < eps && Math.abs(dt.d - dms.d) < eps) {
+                layers++;
+              }
+            }
+            if (layers + 1 <= maxLayers) continue; // stacking allowed here
+          }
+        }
+        return false;
+      }
     }
     return true;
-  }, [items, shelf.rows, shelf.width, types]);
+  }, [getDims, items, shelf.rows, shelf.width, types]);
 
   // Compute the nearest available depth (z) position for an item at x-range without overlapping others
   const findAvailableZ = useCallback((rowIndex, x, wCm, dCm, excludeId) => {
@@ -131,11 +175,11 @@ const App = () => {
     for (const it of items) {
       if (excludeId && it.id === excludeId) continue;
       if (it.row !== rowIndex) continue;
-      const t = types.find(tt => tt.id === it.typeId); if (!t) continue;
-      const ox1 = it.x, ox2 = it.x + t.w;
+      const d = getDims(it);
+      const ox1 = it.x, ox2 = it.x + d.w;
       const overlapX = !(x2 <= ox1 || x1 >= ox2);
       if (!overlapX) continue;
-      occ.push([it.z, it.z + t.d]);
+      occ.push([it.z, it.z + d.d]);
     }
     // Normalize and sort by start
     occ.sort((a, b) => a[0] - b[0]);
@@ -148,27 +192,66 @@ const App = () => {
     }
     if (z + dCm <= row.depth) return z;
     return null;
-  }, [items, shelf.rows, types]);
+  }, [getDims, items, shelf.rows]);
 
   const proposePlacement = useCallback((item, rowInfo, clientX, clientY) => {
     const t = types.find(tt => tt.id === item.typeId); if (!t) return { valid: false, rowIndex: rowInfo.index, x: 0, z: 0 };
     const { rect, index } = rowInfo;
     const localXpx = clamp(clientX - rect.left, 0, rect.width);
+    const dms = getDims(item);
     // Center under cursor horizontally and clamp within shelf width
-    let x = px2cm(localXpx) - t.w / 2; x = clamp(x, 0, shelf.width - t.w);
+    let x = px2cm(localXpx) - dms.w / 2; x = clamp(x, 0, shelf.width - dms.w);
 
-    // Choose a depth that respects existing items at this x-range
-    let z = findAvailableZ(index, x, t.w, t.d, item.id);
+    // If item has a group, try to snap onto an existing group's cell to allow stacking
+    let z = null;
+    const eps = 1e-6;
+    const groupId = item.group || null;
+    if (groupId) {
+      // Find any existing cell for this group with matching dims, closest in x
+      let best = null;
+      for (const it of items) {
+        if (it.row !== index) continue;
+        if (it.group !== groupId) continue;
+        const dt = getDims(it);
+        if (Math.abs(dt.w - dms.w) > eps || Math.abs(dt.d - dms.d) > eps) continue;
+        // Consider this cell at (it.x, it.z)
+        const dx = Math.abs(it.x - x);
+        if (!best || dx < best.dx) best = { x: it.x, z: it.z, dx };
+      }
+      if (best) {
+        // Count existing layers at this cell
+        let layers = 0;
+        for (const it of items) {
+          if (it.row !== index) continue;
+          if (it.group !== groupId) continue;
+          const dt = getDims(it);
+          if (Math.abs(it.x - best.x) < eps && Math.abs(it.z - best.z) < eps && Math.abs(dt.w - dms.w) < eps && Math.abs(dt.d - dms.d) < eps) {
+            layers++;
+          }
+        }
+        const maxLayers = Math.floor((rowInfo.row.height + 1e-6) / dms.h);
+        if (layers < maxLayers) {
+          // Snap x to the group's cell x, keep z the same to stack
+          x = best.x;
+          z = best.z;
+        }
+      }
+    }
+
+    // Choose a depth that respects existing items at this x-range if not stacking onto same cell
+    if (z == null) {
+      z = findAvailableZ(index, x, dms.w, dms.d, item.id);
+    }
     if (z == null) {
       // Fallback to pointer-derived depth within limits
       const localYpx = clamp(clientY - rect.top, 0, rect.height);
       const fromBottom = rect.height - localYpx; // px from front edge
-      z = clamp(px2cm(fromBottom) - t.d / 2, 0, rowInfo.row.depth - t.d);
+      z = clamp(px2cm(fromBottom) - dms.d / 2, 0, rowInfo.row.depth - dms.d);
     }
 
     const valid = fitsInRow(item, index, x, z);
     return { valid, rowIndex: index, x, z };
-  }, [findAvailableZ, fitsInRow, px2cm, shelf.width, types]);
+  }, [findAvailableZ, fitsInRow, getDims, px2cm, shelf.width, types]);
 
   const findRowUnderPointer = useCallback((clientX, clientY) => {
     for (const [index, el] of rowsRef.current.entries()) {
@@ -220,8 +303,8 @@ const App = () => {
     let invalid = false;
     if (rowInfo) {
       const prop = proposePlacement(it, rowInfo, e.clientX, e.clientY);
-      const t = types.find(tt => tt.id === it.typeId);
-      text = `Row ${rowInfo.index + 1} · x:${prop.x.toFixed(1)}cm z:${prop.z.toFixed(1)}cm ${prop.valid ? '✅ fits' : '❌ no fit'}\nRow depth:${rowInfo.row.depth}cm Item d:${t?.d ?? 0}cm`;
+      const dms = getDims(it);
+      text = `Row ${rowInfo.index + 1} · x:${prop.x.toFixed(1)}cm z:${prop.z.toFixed(1)}cm ${prop.valid ? '✅ fits' : '❌ no fit'}\nRow depth:${rowInfo.row.depth}cm Item d:${dms.d}cm`;
       invalid = !prop.valid;
       setHoverRow({ index: rowInfo.index, invalid });
     } else {
@@ -229,7 +312,7 @@ const App = () => {
     }
     hudRef.current = { visible: true, x: e.clientX, y: e.clientY, text };
     forceHud(x => x + 1);
-  }, [findRowUnderPointer, proposePlacement, types]);
+  }, [findRowUnderPointer, proposePlacement, getDims]);
 
   const onPointerUpItem = useCallback((e, it) => {
     const d = dragRef.current; if (!d || d.id !== it.id) return;
@@ -261,14 +344,313 @@ const App = () => {
     forceHud(x => x + 1);
   }, [findRowUnderPointer, proposePlacement, saveAll]);
 
+  // Toggle item rotation (double‑click). Ensures rotated item still fits where placed.
+  const toggleRotate = useCallback((it) => {
+    const cur = items.find(x => x.id === it.id);
+    if (!cur) return;
+    const nextRot = !cur.rot;
+    if (cur.row == null) {
+      setItems(prev => prev.map(p => p.id === it.id ? { ...p, rot: nextRot } : p));
+      setStatus('Edited');
+      setTimeout(saveAll, 0);
+      return;
+    }
+    const rotated = { ...cur, rot: nextRot };
+    const dms = getDims(rotated);
+    let x = clamp(rotated.x, 0, shelf.width - dms.w);
+    let z = rotated.z;
+    if (!fitsInRow(rotated, rotated.row, x, z)) {
+      const bestZ = findAvailableZ(rotated.row, x, dms.w, dms.d, rotated.id);
+      if (bestZ == null || !fitsInRow(rotated, rotated.row, x, bestZ)) {
+        setToast("❌ Doesn't fit after rotation");
+        setTimeout(() => setToast(''), 1600);
+        return;
+      }
+      z = bestZ;
+    }
+    setItems(prev => prev.map(p => p.id === it.id ? { ...p, rot: nextRot, x, z } : p));
+    setStatus('Edited');
+    setTimeout(saveAll, 0);
+  }, [findAvailableZ, fitsInRow, getDims, items, saveAll, shelf.width]);
+
+  // dnd-kit drag handlers
+  const onDragStart = useCallback((event) => {
+    const { active } = event;
+    setActiveId(active?.id || null);
+    if (active?.id) { setSelectedId(active.id); setPanelOpen(true); }
+    hudRef.current = { visible: true, x: clientPos.x, y: clientPos.y, text: 'Drag an item into a row' };
+    forceHud(x => x + 1);
+  }, [clientPos.x, clientPos.y]);
+
+  const onDragMove = useCallback((event) => {
+    const { active, over } = event;
+    if (!active) return;
+    const it = items.find(i => i.id === active.id);
+    if (!it) return;
+
+    let text = 'Drag an item into a row';
+    let invalid = false;
+    if (over && typeof over.id === 'string' && over.id.startsWith('row-')) {
+      const index = Number(over.id.slice(4));
+      const el = rowsRef.current.get(index);
+      if (el) {
+        const rect = el.getBoundingClientRect();
+        const rowInfo = { index, el, rect, row: shelf.rows[index] };
+        const prop = proposePlacement(it, rowInfo, clientPos.x, clientPos.y);
+        const dms = getDims(it);
+        text = `Row ${index + 1} · x:${prop.x.toFixed(1)}cm z:${prop.z.toFixed(1)}cm ${prop.valid ? '✅ fits' : '❌ no fit'}\nRow depth:${rowInfo.row.depth}cm Item d:${dms.d}cm`;
+        invalid = !prop.valid;
+        setHoverRow({ index, invalid });
+      }
+    } else {
+      setHoverRow(null);
+    }
+    hudRef.current = { visible: true, x: clientPos.x, y: clientPos.y, text };
+    forceHud(x => x + 1);
+  }, [clientPos.x, clientPos.y, getDims, items, proposePlacement, shelf.rows]);
+
+  const onDragEnd = useCallback((event) => {
+    const { active, over } = event;
+    const it = items.find(i => i.id === active?.id);
+    if (it && over && typeof over.id === 'string' && over.id.startsWith('row-')) {
+      const index = Number(over.id.slice(4));
+      const el = rowsRef.current.get(index);
+      if (el) {
+        const rect = el.getBoundingClientRect();
+        const rowInfo = { index, el, rect, row: shelf.rows[index] };
+        const prop = proposePlacement(it, rowInfo, clientPos.x, clientPos.y);
+        if (prop.valid) {
+          setItems(prev => prev.map(p => p.id === it.id ? { ...p, row: prop.rowIndex, x: prop.x, z: prop.z } : p));
+          setStatus('Edited');
+          setTimeout(saveAll, 0);
+        } else {
+          setToast("❌ Doesn't fit there");
+          setTimeout(() => setToast(''), 1600);
+        }
+      }
+    } else if (it) {
+      // Drop to pile
+      setItems(prev => prev.map(p => p.id === it.id ? { ...p, row: null, x: 0, z: 0 } : p));
+      setTimeout(saveAll, 0);
+    }
+    setActiveId(null);
+    setHoverRow(null);
+    hudRef.current = { visible: false, x: 0, y: 0, text: '' };
+    forceHud(x => x + 1);
+  }, [clientPos.x, clientPos.y, items, proposePlacement, saveAll, shelf.rows]);
+
   const cssEscapeUrl = (u) => u.replace(/"/g, '\\"');
 
   // Derived UI values
   const widthPx = cm2px(shelf.width);
   const heightPx = cm2px(totalShelfHeight);
 
+  const selectedItem = useMemo(() => items.find(i => i.id === selectedId) || null, [items, selectedId]);
+  const selectedDims = useMemo(() => selectedItem ? getDims(selectedItem) : null, [selectedItem, getDims]);
+  const selectedShelfDims = useMemo(() => {
+    if (!selectedItem) return null;
+    const row = selectedItem.row != null ? shelf.rows[selectedItem.row] : shelf.rows[0];
+    if (!row) return null;
+    return { width: shelf.width, height: row.height, depth: row.depth };
+  }, [selectedItem, shelf.rows, shelf.width]);
+
+  // Arrange-and-place helper: duplicates items per config and places as a block
+  const arrangeAndPlace = useCallback((baseItem, cfg) => {
+    const d = getDims(baseItem);
+    const gapCm = (cfg.gapPx || 0) / Math.max(0.0001, scale);
+    const usedW = cfg.facing * d.w + (cfg.facing - 1) * gapCm;
+    const usedD = cfg.capacity * d.d;
+    const usedH = cfg.stack * d.h;
+
+    // Candidate rows that can fit the whole arrangement
+    const candidates = shelf.rows
+      .map((r, idx) => ({ r, idx }))
+      .filter(({ r }) => usedH <= r.height + 1e-6 && usedD <= r.depth + 1e-6 && usedW <= shelf.width + 1e-6)
+      .map(x => x.idx);
+    if (!candidates.length) {
+      setToast('No shelf row fits this configuration');
+      setTimeout(() => setToast(''), 1600);
+      return false;
+    }
+
+    // Prefer current row if set
+    const ordered = baseItem.row != null && candidates.includes(baseItem.row)
+      ? [baseItem.row, ...candidates.filter(i => i !== baseItem.row)] : candidates;
+
+    let placed = null;
+    for (const rowIndex of ordered) {
+      // Scan x positions
+      const maxX = Math.max(0, shelf.width - usedW);
+      for (let x0 = 0; x0 <= maxX + 1e-6; x0 += 1) {
+        // Use arrangement block to find a free depth slot
+        const z0 = findAvailableZ(rowIndex, x0, usedW, usedD, null);
+        if (z0 == null) continue;
+        // Found anchor top-left (x0, z0)
+        placed = { rowIndex, x0, z0 };
+        break;
+      }
+      if (placed) break;
+    }
+
+    if (!placed) {
+      setToast('No free space found for this configuration');
+      setTimeout(() => setToast(''), 1600);
+      return false;
+    }
+
+    const { rowIndex, x0, z0 } = placed;
+    const clones = [];
+    for (let c = 0; c < cfg.capacity; c++) {
+      for (let f = 0; f < cfg.facing; f++) {
+        for (let s = 0; s < cfg.stack; s++) {
+          const xi = x0 + f * (d.w + (f > 0 ? gapCm : 0));
+          const zi = z0 + c * d.d;
+          clones.push({ xi, zi, s });
+        }
+      }
+    }
+
+    setItems(prev => {
+      const groupId = baseItem.group || baseItem.id;
+      // Remove previous clones from the same group (keep none)
+      const withoutGroup = prev.filter(p => (p.group || p.id) !== groupId || p.id === baseItem.id);
+      const base = withoutGroup.find(p => p.id === baseItem.id);
+      const rest = withoutGroup.filter(p => p.id !== baseItem.id);
+
+      const newItems = [];
+      clones.forEach((cl, idx) => {
+        if (idx === 0 && base) {
+          newItems.push({ ...base, group: groupId, arr: cfg, row: rowIndex, x: cl.xi, z: cl.zi, s: cl.s });
+        } else {
+          newItems.push({ id: uid(), group: groupId, typeId: baseItem.typeId, rot: baseItem.rot, arr: cfg, row: rowIndex, x: cl.xi, z: cl.zi, s: cl.s });
+        }
+      });
+      const next = [...rest, ...newItems];
+      return next;
+    });
+
+    setStatus('Edited');
+    setTimeout(saveAll, 0);
+    setToast(`Placed ${cfg.facing * cfg.capacity * cfg.stack} unit(s)`);
+    setTimeout(() => setToast(''), 1200);
+    return true;
+  }, [findAvailableZ, getDims, saveAll, scale, shelf.rows, shelf.width]);
+
+  // Arrange items of chosen type on a specific row based on configuration
+  const arrangeOnRow = useCallback((rowIndex, typeId, cfg) => {
+    const t = types.find(tt => tt.id === typeId);
+    const row = shelf.rows[rowIndex];
+    if (!t || !row) return false;
+    const d = { w: t.w, h: t.h, d: t.d };
+    const gapCm = (cfg.gapPx || 0) / Math.max(0.0001, scale);
+
+    const existing = items.filter(it => it.row === rowIndex && it.typeId === typeId);
+
+    // Helper to test if a candidate unit fits considering collisions
+    const canPlaceAt = (x, z, group) => {
+      const dummy = { id: 'tmp', typeId, rot: false, group };
+      return fitsInRow(dummy, rowIndex, x, z);
+    };
+
+    // If there are existing items of this type on the row, extend them
+    if (existing.length > 0) {
+      const minX = Math.min(...existing.map(e => e.x));
+      const minZ = Math.min(...existing.map(e => e.z));
+      const stepX = d.w + gapCm;
+      const stepZ = d.d;
+      // Choose most common group to extend; if none, create one
+      const freq = new Map();
+      for (const e of existing) { if (e.group) freq.set(e.group, (freq.get(e.group) || 0) + 1); }
+      let groupId = null;
+      if (freq.size) {
+        groupId = Array.from(freq.entries()).sort((a,b)=>b[1]-a[1])[0][0];
+      } else {
+        groupId = uid();
+      }
+      // Build a set of occupied x|z|s for this type on row
+      const occ = new Set(existing.map(e => `${e.x.toFixed(3)}|${e.z.toFixed(3)}|${Number(e.s||0)}`));
+
+      const additions = [];
+      for (let f = 0; f < cfg.facing; f++) {
+        const x = minX + f * stepX;
+        if (x + d.w > shelf.width + 1e-6) break;
+        for (let c = 0; c < cfg.capacity; c++) {
+          const z = minZ + c * stepZ;
+          if (z + d.d > row.depth + 1e-6) break;
+          for (let s = 0; s < cfg.stack; s++) {
+            const key = `${x.toFixed(3)}|${z.toFixed(3)}|${s}`;
+            if (occ.has(key)) continue; // already present
+            if (!canPlaceAt(x, z, groupId)) continue; // collision with others
+            additions.push({ id: uid(), group: groupId, typeId, rot: false, arr: cfg, row: rowIndex, x, z, s });
+            occ.add(key);
+          }
+        }
+      }
+
+      if (additions.length === 0) {
+        setToast('No space to extend on this row');
+        setTimeout(() => setToast(''), 1200);
+        return false;
+      }
+
+      setItems(prev => prev.map(it => {
+        if (it.row === rowIndex && it.typeId === typeId) {
+          // unify under chosen group to allow stacking overlap rules
+          return { ...it, group: it.group || groupId, arr: it.arr || cfg };
+        }
+        return it;
+      }).concat(additions));
+      setStatus('Edited');
+      setTimeout(saveAll, 0);
+      setToast(`Added ${additions.length} unit(s)`);
+      setTimeout(() => setToast(''), 1200);
+      return true;
+    }
+
+    // Otherwise, place a new block at first free spot (original behavior)
+    const usedW = cfg.facing * d.w + (cfg.facing - 1) * gapCm;
+    const usedD = cfg.capacity * d.d;
+    const usedH = cfg.stack * d.h;
+    if (usedW > shelf.width + 1e-6 || usedD > row.depth + 1e-6 || usedH > row.height + 1e-6) {
+      setToast('Configuration exceeds shelf bounds');
+      setTimeout(() => setToast(''), 1600);
+      return false;
+    }
+    let placed = null;
+    const maxX = Math.max(0, shelf.width - usedW);
+    for (let x0 = 0; x0 <= maxX + 1e-6; x0 += 1) {
+      const z0 = findAvailableZ(rowIndex, x0, usedW, usedD, null);
+      if (z0 == null) continue;
+      placed = { x0, z0 };
+      break;
+    }
+    if (!placed) {
+      setToast('No free space found on this row');
+      setTimeout(() => setToast(''), 1600);
+      return false;
+    }
+    const { x0, z0 } = placed;
+    const groupId = uid();
+    const newItems = [];
+    for (let c = 0; c < cfg.capacity; c++) {
+      for (let f = 0; f < cfg.facing; f++) {
+        for (let s = 0; s < cfg.stack; s++) {
+          const xi = x0 + f * (d.w + (f > 0 ? gapCm : 0));
+          const zi = z0 + c * d.d;
+          newItems.push({ id: uid(), group: groupId, typeId, rot: false, arr: cfg, row: rowIndex, x: xi, z: zi, s });
+        }
+      }
+    }
+    setItems(prev => [...prev, ...newItems]);
+    setStatus('Edited');
+    setTimeout(saveAll, 0);
+    setToast(`Placed ${cfg.facing * cfg.capacity * cfg.stack} unit(s)`);
+    setTimeout(() => setToast(''), 1200);
+    return true;
+  }, [findAvailableZ, fitsInRow, items, saveAll, scale, shelf.rows, shelf.width, types]);
+
   return (
-    <div className="shelf-sim" style={{ height: '100vh', display: 'flex', flexDirection: 'column', background: 'radial-gradient(1200px 600px at 70% -10%, #1b2230, #0f1115 60%)', color: '#e7ecf3' }}>
+    <div className={`shelf-sim ${panelOpen ? 'panel-open' : ''}`} style={{ height: '100vh', display: 'flex', flexDirection: 'column', background: 'radial-gradient(1200px 600px at 70% -10%, #1b2230, #0f1115 60%)', color: '#e7ecf3' }} onMouseMoveCapture={(e) => setClientPos({ x: e.clientX, y: e.clientY })}>
       <style>{`
         .shelf-sim * { box-sizing: border-box; }
         .shelf-sim header { display:flex; align-items:center; justify-content:space-between; padding:12px 16px; background: rgba(10,12,18,.7); backdrop-filter: blur(6px); border-bottom:1px solid #202739; position:sticky; top:0; z-index:50; }
@@ -320,6 +702,8 @@ const App = () => {
         .shelf-sim .row.highlight { outline:2px dashed rgba(103,212,255,.6); outline-offset:2px; }
         .shelf-sim .row.invalid { outline-color: rgba(255,93,115,.8); }
         .shelf-sim .toast { position:fixed; left:50%; transform:translateX(-50%); bottom:18px; background: rgba(13,16,24,.92); border:1px solid #2a3a57; padding:10px 12px; border-radius:10px; font-size:12px; z-index:100000; }
+        /* When auto-configure panel is open, ensure pile items don't overlay */
+        .shelf-sim.panel-open .pile .item { z-index: 1 !important; pointer-events: none; opacity: .7; }
       `}</style>
 
       <header>
@@ -336,6 +720,7 @@ const App = () => {
         </div>
       </header>
 
+      <DndContext onDragStart={onDragStart} onDragMove={onDragMove} onDragEnd={onDragEnd}>
       <div
         className="app"
         style={{ gridTemplateColumns: `${leftCollapsed ? 28 : 320}px minmax(0,1fr) ${rightCollapsed ? 28 : 300}px` }}
@@ -574,42 +959,42 @@ const App = () => {
             <div className="shelf-wrap">
               <div className="shelf" style={{ width: `${widthPx}px`, height: `${heightPx}px`, position: 'relative' }}>
                 {shelf.rows.map((row, idx) => (
-                  <div
+                  <RowDroppable
                     key={idx}
-                    ref={el => rowsRef.current.set(idx, el)}
+                    idx={idx}
                     className={`row ${hoverRow && hoverRow.index === idx ? 'highlight' : ''} ${hoverRow && hoverRow.index === idx && hoverRow.invalid ? 'invalid' : ''}`}
                     style={{ height: `${cm2px(row.height)}px` }}
+                    setRowEl={(el) => rowsRef.current.set(idx, el)}
+                    onBackgroundClick={(rowIndex) => { setSelectedRow(rowIndex); setPanelOpen(true); }}
                   >
-                    <div className="inner">
-                      <div className="backshade"></div>
-                      <div className="plane"></div>
-                      <div className="lip"></div>
-                      <div className="measure">{shelf.width}cm · {row.height}cm / {row.depth}cm</div>
-                    </div>
+                    <div className="backshade"></div>
+                    <div className="plane"></div>
+                    <div className="lip"></div>
+                    <div className="measure">{shelf.width}cm · {row.height}cm / {row.depth}cm</div>
                     {items.filter(it => it.row === idx).map(it => {
                       const t = types.find(tt => tt.id === it.typeId);
                       if (!t) return null;
-                      const w = cm2px(t.w), h = cm2px(t.h);
+                      const dms = getDims(it);
+                      const w = cm2px(dms.w), h = cm2px(dms.h);
                       const left = cm2px(it.x);
-                      const top = cm2px(row.height) - h;
+                      const stackIndex = Number(it.s || 0);
+                      const top = cm2px(row.height - (stackIndex + 1) * dms.h);
                       const brightness = 1 - 0.4 * clamp(it.z / Math.max(1, row.depth), 0, 1);
                       const zLayer = 10000 - Math.floor(it.z * 10);
                       return (
-                        <div
+                        <DraggableItem
                           key={it.id}
-                          ref={el => itemNodesRef.current.set(it.id, el)}
-                          className="item"
-                          style={{ width: `${w}px`, height: `${h}px`, left: `${left}px`, top: `${top}px`, filter: `brightness(${brightness.toFixed(3)})`, zIndex: 100000 + idx * 10000 + zLayer }}
-                          onPointerDown={e => onPointerDownItem(e, it)}
-                          onPointerMove={e => onPointerMoveItem(e, it)}
-                          onPointerUp={e => onPointerUpItem(e, it)}
+                          it={it}
+                          dims={{ w, h, left, top }}
+                          styleExtra={{ filter: `brightness(${brightness.toFixed(3)})`, zIndex: 100000 + idx * 10000 + zLayer + stackIndex }}
+                          onDoubleClick={() => toggleRotate(it)}
                         >
                           <div className="img" style={t.img ? { backgroundImage: `url('${cssEscapeUrl(t.img)}')` } : { background: t.color }} />
-                          <div className="label">{t.name} — {t.w}×{t.h}×{t.d}cm</div>
-                        </div>
+                          <div className="label">{t.name} — {dms.w}×{dms.h}×{dms.d}cm {it.rot ? '(rot)' : ''}</div>
+                        </DraggableItem>
                       );
                     })}
-                  </div>
+                  </RowDroppable>
                 ))}
               </div>
             </div>
@@ -652,21 +1037,20 @@ const App = () => {
               {items.filter(it => it.row === null).map(it => {
                 const t = types.find(tt => tt.id === it.typeId);
                 if (!t) return null;
-                const w = Math.max(60, Math.min(130, cm2px(t.w)));
-                const h = Math.max(36, Math.min(160, cm2px(t.h)));
+                const dms = getDims(it);
+                const w = Math.max(60, Math.min(130, cm2px(dms.w)));
+                const h = Math.max(36, Math.min(160, cm2px(dms.h)));
                 return (
                   <div key={it.id} style={{ position: 'relative', height: `${h}px` }}>
-                    <div
-                      ref={el => itemNodesRef.current.set(it.id, el)}
-                      className="item"
-                      style={{ position: 'absolute', left: 0, top: 0, width: `${w}px`, height: `${h}px`, zIndex: 1000000 }}
-                      onPointerDown={e => onPointerDownItem(e, it)}
-                      onPointerMove={e => onPointerMoveItem(e, it)}
-                      onPointerUp={e => onPointerUpItem(e, it)}
+                    <DraggableItem
+                      it={it}
+                      dims={{ w, h, left: 0, top: 0 }}
+                      styleExtra={{ position: 'absolute', left: 0, top: 0, zIndex: 1000000 }}
+                      onDoubleClick={() => toggleRotate(it)}
                     >
                       <div className="img" style={t.img ? { backgroundImage: `url('${cssEscapeUrl(t.img)}')` } : { background: t.color }} />
-                      <div className="label">{t.name}</div>
-                    </div>
+                      <div className="label">{t.name} {it.rot ? '(rot)' : ''}</div>
+                    </DraggableItem>
                   </div>
                 );
               })}
@@ -676,13 +1060,65 @@ const App = () => {
           )}
         </aside>
       </div>
+      </DndContext>
 
       {hudRef.current.visible && (
         <div className="drag-hud" style={{ left: `${hudRef.current.x}px`, top: `${hudRef.current.y}px` }}>{hudRef.current.text}</div>
       )}
       {!!toast && <div className="toast">{toast}</div>}
+      {panelOpen && selectedRow != null && (
+        <RowConfigPanel
+          open={panelOpen}
+          types={types}
+          initialTypeId={types[0]?.id}
+          initial={{ facing: 1, gapPx: 0, capacity: 1, stack: 1 }}
+          shelfDims={{ width: shelf.width, height: shelf.rows[selectedRow]?.height || 0, depth: shelf.rows[selectedRow]?.depth || 0 }}
+          pxPerCm={scale}
+          onApply={({ cfg, typeId }) => { arrangeOnRow(selectedRow, typeId, cfg); setPanelOpen(false); setSelectedRow(null); }}
+          onCancel={() => { setPanelOpen(false); setSelectedRow(null); }}
+        />
+      )}
     </div>
   );
 };
+
+// Row droppable wrapper
+function RowDroppable({ idx, children, className, style, setRowEl, onBackgroundClick }) {
+  const { setNodeRef } = useDroppable({ id: `row-${idx}` });
+  const refCb = useCallback((el) => {
+    setNodeRef(el);
+    setRowEl?.(el);
+  }, [setNodeRef, setRowEl]);
+  const handleClick = useCallback((e) => {
+    if (e.target.closest && e.target.closest('.item')) return;
+    onBackgroundClick?.(idx);
+  }, [idx, onBackgroundClick]);
+  return (
+    <div className={className} style={style}>
+      <div className="inner" ref={refCb} onClickCapture={handleClick}>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+// Draggable item wrapper
+function DraggableItem({ it, dims, styleExtra, onDoubleClick, onClick, children }) {
+  const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({ id: it.id });
+  const style = {
+    width: `${dims.w}px`,
+    height: `${dims.h}px`,
+    left: `${dims.left}px`,
+    top: `${dims.top}px`,
+    transform: transform ? `translate3d(${transform.x}px, ${transform.y}px, 0)` : undefined,
+    ...(styleExtra || {})
+  };
+  const cls = `item${isDragging ? ' dragging' : ''}`;
+  return (
+    <div ref={setNodeRef} className={cls} style={style} {...listeners} {...attributes} onDoubleClick={onDoubleClick} onClick={onClick}>
+      {children}
+    </div>
+  );
+}
 
 export default App;
